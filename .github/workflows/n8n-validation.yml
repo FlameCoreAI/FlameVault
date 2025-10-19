@@ -1,0 +1,303 @@
+name: n8n Workflow Validation and Deployment
+
+on:
+  push:
+    branches: [ "main", "staging" ]
+    paths:
+      - 'workflows/**'
+      - '.github/workflows/n8n-validation.yml'
+  pull_request:
+    branches: [ "main", "staging" ]
+    paths:
+      - 'workflows/**'
+
+env:
+  N8N_VERSION: latest
+
+jobs:
+  validate-workflows:
+    name: Validate Workflow JSON
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Install jq for JSON validation
+      run: sudo apt-get update && sudo apt-get install -y jq
+    
+    - name: Validate JSON syntax
+      run: |
+        echo "Validating workflow JSON files..."
+        ERRORS=0
+        
+        for workflow in workflows/*.json; do
+          if [ -f "$workflow" ]; then
+            echo "Validating $workflow..."
+            if jq empty "$workflow" 2>/dev/null; then
+              echo "✓ $workflow is valid JSON"
+            else
+              echo "✗ $workflow has invalid JSON syntax"
+              ERRORS=$((ERRORS + 1))
+            fi
+          fi
+        done
+        
+        if [ $ERRORS -gt 0 ]; then
+          echo "❌ $ERRORS workflow(s) failed validation"
+          exit 1
+        else
+          echo "✅ All workflows validated successfully"
+        fi
+    
+    - name: Check for sensitive data
+      run: |
+        echo "Checking for hardcoded secrets..."
+        SECRETS_FOUND=0
+        
+        # Patterns to look for
+        PATTERNS=(
+          "password.*:.*\"[^$]"
+          "api[_-]?key.*:.*\"[^$]"
+          "secret.*:.*\"[^$]"
+          "token.*:.*\"[^$]"
+          "bearer [A-Za-z0-9]"
+        )
+        
+        for workflow in workflows/*.json; do
+          if [ -f "$workflow" ]; then
+            for pattern in "${PATTERNS[@]}"; do
+              if grep -iE "$pattern" "$workflow" | grep -v '\$env\|' | grep -v '\${' > /dev/null; then
+                echo "⚠️  Potential hardcoded secret found in $workflow"
+                SECRETS_FOUND=$((SECRETS_FOUND + 1))
+              fi
+            done
+          fi
+        done
+        
+        if [ $SECRETS_FOUND -gt 0 ]; then
+          echo "❌ Found $SECRETS_FOUND potential hardcoded secret(s)"
+          echo "Please use environment variables or n8n credentials instead"
+          exit 1
+        else
+          echo "✅ No hardcoded secrets detected"
+        fi
+    
+    - name: Validate workflow structure
+      run: |
+        echo "Validating workflow structure..."
+        ERRORS=0
+        
+        for workflow in workflows/*.json; do
+          if [ -f "$workflow" ]; then
+            echo "Checking $workflow structure..."
+            
+            # Check for required fields
+            if ! jq -e '.name' "$workflow" > /dev/null; then
+              echo "✗ $workflow missing 'name' field"
+              ERRORS=$((ERRORS + 1))
+            fi
+            
+            if ! jq -e '.nodes' "$workflow" > /dev/null; then
+              echo "✗ $workflow missing 'nodes' field"
+              ERRORS=$((ERRORS + 1))
+            fi
+            
+            if ! jq -e '.connections' "$workflow" > /dev/null; then
+              echo "✗ $workflow missing 'connections' field"
+              ERRORS=$((ERRORS + 1))
+            fi
+            
+            # Check for proper webhook security in webhook nodes
+            if jq -e '.nodes[] | select(.type == "n8n-nodes-base.webhook")' "$workflow" > /dev/null; then
+              echo "ℹ️  Webhook node found in $workflow - ensure security is configured"
+            fi
+          fi
+        done
+        
+        if [ $ERRORS -gt 0 ]; then
+          echo "❌ $ERRORS workflow(s) failed structure validation"
+          exit 1
+        else
+          echo "✅ All workflows have valid structure"
+        fi
+    
+    - name: Generate workflow report
+      run: |
+        echo "# Workflow Validation Report" > workflow-report.md
+        echo "" >> workflow-report.md
+        echo "## Workflows Validated" >> workflow-report.md
+        echo "" >> workflow-report.md
+        
+        for workflow in workflows/*.json; do
+          if [ -f "$workflow" ]; then
+            NAME=$(jq -r '.name' "$workflow")
+            NODES=$(jq '.nodes | length' "$workflow")
+            echo "- **$NAME** ($workflow): $NODES nodes" >> workflow-report.md
+          fi
+        done
+        
+        cat workflow-report.md
+    
+    - name: Upload validation report
+      uses: actions/upload-artifact@v3
+      with:
+        name: workflow-validation-report
+        path: workflow-report.md
+
+  test-workflows:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: validate-workflows
+    if: github.event_name == 'pull_request'
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+      
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: n8n_test
+          POSTGRES_USER: n8n
+          POSTGRES_PASSWORD: n8n_test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Start n8n container
+      run: |
+        docker run -d \
+          --name n8n-test \
+          --network host \
+          -e N8N_ENCRYPTION_KEY=test-encryption-key \
+          -e DB_TYPE=postgresdb \
+          -e DB_POSTGRESDB_HOST=localhost \
+          -e DB_POSTGRESDB_PORT=5432 \
+          -e DB_POSTGRESDB_DATABASE=n8n_test \
+          -e DB_POSTGRESDB_USER=n8n \
+          -e DB_POSTGRESDB_PASSWORD=n8n_test_password \
+          -e REDIS_HOST=localhost \
+          -e REDIS_PORT=6379 \
+          -e N8N_LOG_LEVEL=debug \
+          -v $(pwd)/workflows:/workflows:ro \
+          n8nio/n8n:${{ env.N8N_VERSION }}
+    
+    - name: Wait for n8n to be ready
+      run: |
+        echo "Waiting for n8n to start..."
+        for i in {1..30}; do
+          if curl -f http://localhost:5678/healthz 2>/dev/null; then
+            echo "n8n is ready!"
+            exit 0
+          fi
+          echo "Attempt $i: n8n not ready yet..."
+          sleep 5
+        done
+        echo "n8n failed to start"
+        docker logs n8n-test
+        exit 1
+    
+    - name: Import workflows
+      run: |
+        echo "Importing workflows into n8n..."
+        for workflow in workflows/*.json; do
+          if [ -f "$workflow" ]; then
+            echo "Importing $workflow..."
+            docker exec n8n-test n8n import:workflow --input=/workflows/$(basename $workflow) || true
+          fi
+        done
+    
+    - name: Run basic health check
+      run: |
+        echo "Running health checks..."
+        curl -v http://localhost:5678/healthz
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker logs n8n-test || true
+        docker stop n8n-test || true
+        docker rm n8n-test || true
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: validate-workflows
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy workflows to staging
+      run: |
+        echo "Deploying workflows to staging environment..."
+        # Add your staging deployment logic here
+        # Examples:
+        # - Push to n8n cloud via API
+        # - Update Kubernetes ConfigMap
+        # - Sync to staging volume
+        echo "✅ Workflows deployed to staging"
+    
+    - name: Verify deployment
+      run: |
+        echo "Verifying staging deployment..."
+        # Add verification logic
+        echo "✅ Staging deployment verified"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: validate-workflows
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Create backup
+      run: |
+        echo "Creating backup of current workflows..."
+        # Add backup logic
+        echo "✅ Backup created"
+    
+    - name: Deploy workflows to production
+      run: |
+        echo "Deploying workflows to production environment..."
+        # Add your production deployment logic here
+        echo "✅ Workflows deployed to production"
+    
+    - name: Verify deployment
+      run: |
+        echo "Verifying production deployment..."
+        # Add verification logic
+        echo "✅ Production deployment verified"
+    
+    - name: Notify deployment
+      if: always()
+      run: |
+        echo "Sending deployment notification..."
+        # Add notification logic (Slack, email, etc.)

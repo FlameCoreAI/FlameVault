@@ -1,0 +1,449 @@
+{
+  "name": "AI Brain Request Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ai-brain-webhook",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "ai-brain-webhook-001"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Webhook Security: Verify HMAC signature\nconst crypto = require('crypto');\n\nconst secret = $env('WEBHOOK_SECRET');\nconst signature = $input.item.json.headers['x-signature'];\nconst payload = JSON.stringify($input.item.json.body);\n\nif (!secret) {\n  throw new Error('WEBHOOK_SECRET not configured');\n}\n\nconst expectedSignature = crypto\n  .createHmac('sha256', secret)\n  .update(payload)\n  .digest('hex');\n\nif (signature !== expectedSignature) {\n  throw new Error('Invalid webhook signature');\n}\n\n// Extract and validate request data\nconst requestData = $input.item.json.body;\n\nif (!requestData || !requestData.message) {\n  throw new Error('Invalid request: missing message field');\n}\n\n// Generate request ID for tracking and idempotency\nconst requestId = requestData.requestId || crypto.randomUUID();\n\n// Log workflow start\nconsole.log(`[AI-Brain-Workflow] Started processing request ${requestId}`);\n\nreturn {\n  json: {\n    requestId,\n    message: requestData.message,\n    timestamp: new Date().toISOString(),\n    metadata: requestData.metadata || {}\n  }\n};"
+      },
+      "name": "Validate & Extract Request",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{\"request:\" + $json.requestId}}"
+      },
+      "name": "Check Idempotency (Redis)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "redis": {
+          "id": "1",
+          "name": "Redis Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.value}}",
+              "operation": "isEmpty"
+            }
+          ]
+        }
+      },
+      "name": "Is New Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{\"request:\" + $json.requestId}}",
+        "value": "={{JSON.stringify($json)}}",
+        "expire": true,
+        "ttl": 3600
+      },
+      "name": "Mark Request as Processing (Redis)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "redis": {
+          "id": "1",
+          "name": "Redis Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{$env('AI_BRAIN_URL')}}/api/v1/process",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Request-ID",
+              "value": "={{$json.requestId}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "message",
+              "value": "={{$json.message}}"
+            },
+            {
+              "name": "metadata",
+              "value": "={{JSON.stringify($json.metadata)}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "retry": {
+            "enabled": true,
+            "maxRetries": 3,
+            "waitBetweenRetries": 1000,
+            "backoffRate": 2
+          }
+        }
+      },
+      "name": "Call AI Brain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1250, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "2",
+          "name": "AI Brain API Key"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json.statusCode}}",
+              "operation": "equal",
+              "value2": 200
+            }
+          ]
+        }
+      },
+      "name": "AI Brain Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Process successful AI Brain response\nconst response = $input.item.json;\n\n// Log success\nconsole.log(`[AI-Brain-Workflow] Successfully processed request ${response.requestId}`);\n\n// Emit metrics\nconst metrics = {\n  workflow: 'ai-brain-request-handler',\n  status: 'success',\n  duration_ms: Date.now() - new Date(response.timestamp).getTime(),\n  requestId: response.requestId\n};\n\n// Structure response\nreturn {\n  json: {\n    success: true,\n    requestId: response.requestId,\n    data: response.body || response.data,\n    timestamp: new Date().toISOString(),\n    metrics\n  }\n};"
+      },
+      "name": "Format Success Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1650, 100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{JSON.stringify($json)}}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "name": "Send Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1850, 100]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Handle AI Brain failure\nconst error = $input.item.json;\nconst originalData = $json;\n\n// Log error\nconsole.error(`[AI-Brain-Workflow] AI Brain call failed for request ${originalData.requestId}:`, error);\n\n// Structure error for dead letter queue\nconst deadLetterPayload = {\n  workflow: 'ai-brain-request-handler',\n  requestId: originalData.requestId,\n  originalRequest: originalData,\n  error: {\n    message: error.message || 'Unknown error',\n    statusCode: error.statusCode,\n    response: error.response\n  },\n  timestamp: new Date().toISOString(),\n  retryCount: 0\n};\n\nreturn {\n  json: deadLetterPayload\n};"
+      },
+      "name": "Prepare Error for DLQ",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{\"dlq:\" + $json.requestId}}",
+        "value": "={{JSON.stringify($json)}}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "name": "Store in Dead Letter Queue (Redis)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "redis": {
+          "id": "1",
+          "name": "Redis Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{$env('SLACK_WEBHOOK_URL')}}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{\"🚨 AI Brain Workflow Failed\\nRequest ID: \" + $json.requestId + \"\\nError: \" + $json.error.message}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [2050, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{JSON.stringify({\n  success: false,\n  requestId: $json.requestId,\n  error: \"Request processing failed\",\n  message: \"Your request has been saved and will be retried\"\n})}}",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "name": "Send Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{JSON.stringify({\n  success: false,\n  requestId: $json.requestId,\n  error: \"Duplicate request\",\n  message: \"This request has already been processed\"\n})}}",
+        "options": {
+          "responseCode": 409,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "name": "Send Duplicate Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Emit workflow metrics\nconst metrics = {\n  workflow: 'ai-brain-request-handler',\n  event: 'workflow_complete',\n  success: true,\n  timestamp: new Date().toISOString()\n};\n\n// Send to monitoring system (Prometheus, Datadog, etc.)\n// This would typically be done via HTTP request to a metrics endpoint\nconsole.log('[METRICS]', JSON.stringify(metrics));\n\nreturn { json: $input.item.json };"
+      },
+      "name": "Emit Metrics",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2050, 100]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Extract Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Extract Request": {
+      "main": [
+        [
+          {
+            "node": "Check Idempotency (Redis)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Idempotency (Redis)": {
+      "main": [
+        [
+          {
+            "node": "Is New Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is New Request?": {
+      "main": [
+        [
+          {
+            "node": "Mark Request as Processing (Redis)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Duplicate Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Request as Processing (Redis)": {
+      "main": [
+        [
+          {
+            "node": "Call AI Brain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call AI Brain": {
+      "main": [
+        [
+          {
+            "node": "AI Brain Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Brain Success?": {
+      "main": [
+        [
+          {
+            "node": "Format Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error for DLQ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Success Response": {
+      "main": [
+        [
+          {
+            "node": "Emit Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Emit Metrics": {
+      "main": [
+        [
+          {
+            "node": "Send Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error for DLQ": {
+      "main": [
+        [
+          {
+            "node": "Store in Dead Letter Queue (Redis)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store in Dead Letter Queue (Redis)": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "production",
+      "id": "1"
+    },
+    {
+      "name": "ai-brain",
+      "id": "2"
+    }
+  ],
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "flamevault-n8n-001"
+  }
+}
